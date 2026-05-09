@@ -1,4 +1,4 @@
-import { Gauge, RefreshCw, Wifi } from 'lucide-react';
+import { ArrowDownNarrowWide, Gauge, RefreshCw, Wifi } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import React, {
   useCallback,
@@ -18,6 +18,89 @@ import ExternalImage from '@/components/ExternalImage';
 
 // 定义视频信息类型
 type VideoInfo = VideoSourceTestResult;
+type SourceSortMode = 'default' | 'latency';
+
+interface SourceSortItem {
+  source: SearchResult;
+  sourceKey: string;
+  originalIndex: number;
+  isCurrentSource: boolean;
+  isTesting: boolean;
+  videoInfo?: VideoInfo;
+}
+
+function hasMeasuredLatency(videoInfo?: VideoInfo) {
+  return Boolean(
+    videoInfo &&
+    !videoInfo.hasError &&
+    Number.isFinite(videoInfo.pingTime) &&
+    videoInfo.pingTime > 0,
+  );
+}
+
+function getLatencySortBucket(
+  videoInfo: VideoInfo | undefined,
+  isTesting: boolean,
+) {
+  if (hasMeasuredLatency(videoInfo)) return 0;
+  if (videoInfo && !videoInfo.hasError) return 1;
+  if (isTesting) return 2;
+  if (!videoInfo) return 3;
+  return 4;
+}
+
+function compareDefaultSourceOrder(a: SourceSortItem, b: SourceSortItem) {
+  if (a.isCurrentSource && !b.isCurrentSource) return -1;
+  if (!a.isCurrentSource && b.isCurrentSource) return 1;
+  return a.originalIndex - b.originalIndex;
+}
+
+function compareLatencyMetrics(a: SourceSortItem, b: SourceSortItem) {
+  const pingDiff = (a.videoInfo?.pingTime || 0) - (b.videoInfo?.pingTime || 0);
+  if (pingDiff !== 0) return pingDiff;
+
+  const speedDiff =
+    (b.videoInfo?.speedKBps || 0) - (a.videoInfo?.speedKBps || 0);
+  if (speedDiff !== 0) return speedDiff;
+
+  if (a.isCurrentSource && !b.isCurrentSource) return -1;
+  if (!a.isCurrentSource && b.isCurrentSource) return 1;
+
+  return a.originalIndex - b.originalIndex;
+}
+
+function compareLatencySourceOrder(a: SourceSortItem, b: SourceSortItem) {
+  const bucketDiff =
+    getLatencySortBucket(a.videoInfo, a.isTesting) -
+    getLatencySortBucket(b.videoInfo, b.isTesting);
+  if (bucketDiff !== 0) return bucketDiff;
+
+  if (hasMeasuredLatency(a.videoInfo) && hasMeasuredLatency(b.videoInfo)) {
+    return compareLatencyMetrics(a, b);
+  }
+
+  if (
+    a.videoInfo &&
+    b.videoInfo &&
+    !a.videoInfo.hasError &&
+    !b.videoInfo.hasError
+  ) {
+    const speedDiff =
+      (b.videoInfo.speedKBps || 0) - (a.videoInfo.speedKBps || 0);
+    if (speedDiff !== 0) return speedDiff;
+  }
+
+  if (a.isCurrentSource && !b.isCurrentSource) return -1;
+  if (!a.isCurrentSource && b.isCurrentSource) return 1;
+
+  return a.originalIndex - b.originalIndex;
+}
+
+function getLatencyTextClassName(pingTime: number) {
+  if (pingTime <= 600) return 'text-green-600 dark:text-green-400';
+  if (pingTime <= 1800) return 'text-orange-600 dark:text-orange-400';
+  return 'text-red-600 dark:text-red-400';
+}
 
 interface EpisodeSelectorProps {
   /** 总集数 */
@@ -76,6 +159,9 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
   );
   const [manualTesting, setManualTesting] = useState(false);
   const [manualProgress, setManualProgress] = useState({ done: 0, total: 0 });
+  const [sourceSortMode, setSourceSortMode] =
+    useState<SourceSortMode>('default');
+  const [hasManualTested, setHasManualTested] = useState(false);
 
   // 使用 ref 来避免闭包问题
   const attemptedSourcesRef = useRef<Set<string>>(new Set());
@@ -123,10 +209,49 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
     [value],
   );
 
+  const sourceListSignature = useMemo(
+    () => availableSources.map((source) => getSourceKey(source)).join('|'),
+    [availableSources, getSourceKey],
+  );
+
+  const testScopeRef = useRef({
+    episode: value,
+    sourceListSignature,
+  });
+  const testScopeVersionRef = useRef(0);
+
+  useEffect(() => {
+    const previousScope = testScopeRef.current;
+    if (
+      previousScope.episode === value &&
+      previousScope.sourceListSignature === sourceListSignature
+    ) {
+      return;
+    }
+
+    testScopeRef.current = { episode: value, sourceListSignature };
+    testScopeVersionRef.current += 1;
+    const emptyVideoInfoMap = new Map<string, VideoInfo>();
+    const emptyAttemptedSources = new Set<string>();
+    const emptyTestingSourceKeys = new Set<string>();
+
+    setVideoInfoMap(emptyVideoInfoMap);
+    setAttemptedSources(emptyAttemptedSources);
+    setTestingSourceKeys(emptyTestingSourceKeys);
+    setManualProgress({ done: 0, total: 0 });
+    setSourceSortMode('default');
+    setHasManualTested(false);
+    videoInfoMapRef.current = emptyVideoInfoMap;
+    attemptedSourcesRef.current = emptyAttemptedSources;
+  }, [sourceListSignature, value]);
+
   // 获取视频信息的函数 - 移除 attemptedSources 依赖避免不必要的重新创建
   const getVideoInfo = useCallback(
     async (source: SearchResult, force = false) => {
       const sourceKey = getSourceKey(source);
+      const requestScopeVersion = testScopeVersionRef.current;
+      const isCurrentTestScope = () =>
+        testScopeVersionRef.current === requestScopeVersion;
 
       // 使用 ref 获取最新的状态，避免闭包问题
       if (!force && attemptedSourcesRef.current.has(sourceKey)) {
@@ -141,21 +266,23 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
       setTestingSourceKeys((prev) => new Set(prev).add(sourceKey));
 
       if (!episodeUrl) {
-        setVideoInfoMap((prev) =>
-          new Map(prev).set(sourceKey, {
-            quality: '未知',
-            loadSpeed: '未知',
-            pingTime: 0,
-            hasError: true,
-            status: 'failed',
-            message: '没有可用播放地址',
-          }),
-        );
-        setTestingSourceKeys((prev) => {
-          const next = new Set(prev);
-          next.delete(sourceKey);
-          return next;
-        });
+        if (isCurrentTestScope()) {
+          setVideoInfoMap((prev) =>
+            new Map(prev).set(sourceKey, {
+              quality: '未知',
+              loadSpeed: '未知',
+              pingTime: 0,
+              hasError: true,
+              status: 'failed',
+              message: '没有可用播放地址',
+            }),
+          );
+          setTestingSourceKeys((prev) => {
+            const next = new Set(prev);
+            next.delete(sourceKey);
+            return next;
+          });
+        }
         return;
       }
 
@@ -163,25 +290,31 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
         const info = await getVideoResolutionFromM3u8(episodeUrl, {
           timeoutMs: force ? 12000 : 10000,
         });
-        setVideoInfoMap((prev) => new Map(prev).set(sourceKey, info));
+        if (isCurrentTestScope()) {
+          setVideoInfoMap((prev) => new Map(prev).set(sourceKey, info));
+        }
       } catch (error) {
         // 失败时保存错误状态
-        setVideoInfoMap((prev) =>
-          new Map(prev).set(sourceKey, {
-            quality: '未知',
-            loadSpeed: '未知',
-            pingTime: 0,
-            hasError: true,
-            status: 'failed',
-            message: error instanceof Error ? error.message : '检测失败',
-          }),
-        );
+        if (isCurrentTestScope()) {
+          setVideoInfoMap((prev) =>
+            new Map(prev).set(sourceKey, {
+              quality: '未知',
+              loadSpeed: '未知',
+              pingTime: 0,
+              hasError: true,
+              status: 'failed',
+              message: error instanceof Error ? error.message : '检测失败',
+            }),
+          );
+        }
       } finally {
-        setTestingSourceKeys((prev) => {
-          const next = new Set(prev);
-          next.delete(sourceKey);
-          return next;
-        });
+        if (isCurrentTestScope()) {
+          setTestingSourceKeys((prev) => {
+            const next = new Set(prev);
+            next.delete(sourceKey);
+            return next;
+          });
+        }
       }
     },
     [getSourceKey, getTestEpisodeUrl],
@@ -190,6 +323,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
   const handleManualSpeedTest = useCallback(async () => {
     if (availableSources.length === 0 || manualTesting) return;
 
+    const requestScopeVersion = testScopeVersionRef.current;
     setManualTesting(true);
     setManualProgress({ done: 0, total: availableSources.length });
 
@@ -200,14 +334,20 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
         await Promise.all(
           batch.map(async (source) => {
             await getVideoInfo(source, true);
-            setManualProgress((prev) => ({
-              done: Math.min(prev.done + 1, prev.total),
-              total: prev.total,
-            }));
+            if (testScopeVersionRef.current === requestScopeVersion) {
+              setManualProgress((prev) => ({
+                done: Math.min(prev.done + 1, prev.total),
+                total: prev.total,
+              }));
+            }
           }),
         );
       }
     } finally {
+      if (testScopeVersionRef.current === requestScopeVersion) {
+        setSourceSortMode('latency');
+        setHasManualTested(true);
+      }
       setManualTesting(false);
     }
   }, [availableSources, getVideoInfo, manualTesting]);
@@ -422,6 +562,88 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
     currentStart + episodesPerPage - 1,
     totalEpisodes,
   );
+
+  const sourceItems = useMemo<SourceSortItem[]>(
+    () =>
+      availableSources.map((source, originalIndex) => {
+        const sourceKey = getSourceKey(source);
+        return {
+          source,
+          sourceKey,
+          originalIndex,
+          isCurrentSource:
+            source.source?.toString() === currentSource?.toString() &&
+            source.id?.toString() === currentId?.toString(),
+          isTesting: testingSourceKeys.has(sourceKey),
+          videoInfo: videoInfoMap.get(sourceKey),
+        };
+      }),
+    [
+      availableSources,
+      currentId,
+      currentSource,
+      getSourceKey,
+      testingSourceKeys,
+      videoInfoMap,
+    ],
+  );
+
+  const rankedLatencyItems = useMemo(
+    () =>
+      sourceItems
+        .filter((item) => hasMeasuredLatency(item.videoInfo))
+        .sort(compareLatencyMetrics),
+    [sourceItems],
+  );
+
+  const latencyRankBySourceKey = useMemo(() => {
+    const ranks = new Map<string, number>();
+    rankedLatencyItems.forEach((item, index) => {
+      ranks.set(item.sourceKey, index + 1);
+    });
+    return ranks;
+  }, [rankedLatencyItems]);
+
+  const fastestLatencyItem = rankedLatencyItems[0] || null;
+
+  const testedSourceCount = useMemo(
+    () => sourceItems.filter((item) => Boolean(item.videoInfo)).length,
+    [sourceItems],
+  );
+
+  const failedSourceCount = useMemo(
+    () => sourceItems.filter((item) => item.videoInfo?.hasError).length,
+    [sourceItems],
+  );
+
+  const displaySourceItems = useMemo(() => {
+    const items = [...sourceItems];
+    items.sort(
+      sourceSortMode === 'latency'
+        ? compareLatencySourceOrder
+        : compareDefaultSourceOrder,
+    );
+    return items;
+  }, [sourceItems, sourceSortMode]);
+
+  const sourceSortStatusText = (() => {
+    if (manualTesting) {
+      return `测速中 ${manualProgress.done}/${manualProgress.total}`;
+    }
+
+    if (sourceSortMode === 'latency') {
+      if (fastestLatencyItem?.videoInfo) {
+        return `最快 ${fastestLatencyItem.videoInfo.pingTime}ms · ${fastestLatencyItem.source.source_name}`;
+      }
+      return failedSourceCount > 0 ? '测速完成，暂无可用延迟' : '等待延迟数据';
+    }
+
+    if (hasManualTested) {
+      return `已测速 ${testedSourceCount}/${availableSources.length}`;
+    }
+
+    return '手动测速后自动排序';
+  })();
 
   const getSourceStatusBadge = (
     videoInfo: VideoInfo | undefined,
@@ -640,7 +862,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
             !sourceSearchError &&
             availableSources.length > 0 && (
               <>
-                <div className='mb-3 rounded-xl border border-gray-300/70 bg-white/45 p-2 shadow-sm dark:border-white/10 dark:bg-white/5'>
+                <div className='mb-3 rounded-lg border border-gray-300/70 bg-white/45 p-2 shadow-sm dark:border-white/10 dark:bg-white/5'>
                   <div className='flex items-center justify-between gap-2'>
                     <div className='flex min-w-0 items-center gap-2'>
                       <span className='inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/12 text-emerald-600 dark:text-emerald-300'>
@@ -672,65 +894,95 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                         : '手动测速'}
                     </button>
                   </div>
+                  <div className='mt-2 flex items-center justify-between gap-2 border-t border-gray-300/70 pt-2 dark:border-white/10'>
+                    <div className='inline-flex h-7 shrink-0 rounded-md bg-gray-200/70 p-0.5 dark:bg-black/20'>
+                      <button
+                        type='button'
+                        onClick={() => setSourceSortMode('default')}
+                        aria-pressed={sourceSortMode === 'default'}
+                        className={`rounded px-2.5 text-[11px] font-medium transition ${
+                          sourceSortMode === 'default'
+                            ? 'bg-white text-gray-900 shadow-sm dark:bg-white/15 dark:text-white'
+                            : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100'
+                        }`}
+                      >
+                        默认
+                      </button>
+                      <button
+                        type='button'
+                        onClick={() => setSourceSortMode('latency')}
+                        aria-pressed={sourceSortMode === 'latency'}
+                        className={`inline-flex items-center gap-1 rounded px-2.5 text-[11px] font-medium transition ${
+                          sourceSortMode === 'latency'
+                            ? 'bg-white text-emerald-700 shadow-sm dark:bg-white/15 dark:text-emerald-200'
+                            : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100'
+                        }`}
+                      >
+                        <ArrowDownNarrowWide className='h-3 w-3' />
+                        延迟
+                      </button>
+                    </div>
+                    <div
+                      className='min-w-0 flex-1 truncate text-right text-[11px] text-gray-500 dark:text-gray-400'
+                      title={sourceSortStatusText}
+                    >
+                      {sourceSortStatusText}
+                    </div>
+                  </div>
                 </div>
                 <div className='flex-1 overflow-y-auto space-y-2 pb-20'>
-                  {[...availableSources]
-                    .sort((a, b) => {
-                      const aIsCurrent =
-                        a.source?.toString() === currentSource?.toString() &&
-                        a.id?.toString() === currentId?.toString();
-                      const bIsCurrent =
-                        b.source?.toString() === currentSource?.toString() &&
-                        b.id?.toString() === currentId?.toString();
-                      if (aIsCurrent && !bIsCurrent) return -1;
-                      if (!aIsCurrent && bIsCurrent) return 1;
-                      return 0;
-                    })
-                    .map((source, index) => {
-                      const isCurrentSource =
-                        source.source?.toString() ===
-                          currentSource?.toString() &&
-                        source.id?.toString() === currentId?.toString();
-                      const sourceKey = getSourceKey(source);
-                      const videoInfo = videoInfoMap.get(sourceKey);
-                      const isTesting = testingSourceKeys.has(sourceKey);
-                      const statusBadge = getSourceStatusBadge(
-                        videoInfo,
-                        isTesting,
-                      );
-                      return (
-                        <div
-                          key={sourceKey}
-                          onClick={() =>
-                            !isCurrentSource && handleSourceClick(source)
-                          }
-                          className={`flex items-start gap-3 px-2 py-3 rounded-lg transition-all select-none duration-200 relative
+                  {displaySourceItems.map((item, index) => {
+                    const {
+                      source,
+                      sourceKey,
+                      isCurrentSource,
+                      isTesting,
+                      videoInfo,
+                    } = item;
+                    const latencyRank = latencyRankBySourceKey.get(sourceKey);
+                    const statusBadge = getSourceStatusBadge(
+                      videoInfo,
+                      isTesting,
+                    );
+                    return (
+                      <div
+                        key={sourceKey}
+                        onClick={() =>
+                          !isCurrentSource && handleSourceClick(source)
+                        }
+                        className={`flex items-start gap-3 px-2 py-3 rounded-lg transition-all select-none duration-200 relative
                       ${
                         isCurrentSource
                           ? 'bg-green-500/10 dark:bg-green-500/20 border-green-500/30 border'
                           : 'hover:bg-gray-200/50 dark:hover:bg-white/10 hover:scale-[1.02] cursor-pointer'
                       }`.trim()}
-                        >
-                          {/* 封面 */}
-                          <div className='relative shrink-0 w-12 h-20 bg-gray-300 dark:bg-gray-600 rounded overflow-hidden'>
-                            {source.episodes && source.episodes.length > 0 && (
-                              <ExternalImage
-                                src={source.poster || ''}
-                                alt={source.title}
-                                fill
-                                className='object-cover'
-                                loading='lazy'
-                                decoding='async'
-                                sizes='48px'
-                              />
-                            )}
-                          </div>
+                      >
+                        {/* 封面 */}
+                        <div className='relative shrink-0 w-12 h-20 bg-gray-300 dark:bg-gray-600 rounded overflow-hidden'>
+                          {source.episodes && source.episodes.length > 0 && (
+                            <ExternalImage
+                              src={source.poster || ''}
+                              alt={source.title}
+                              fill
+                              className='object-cover'
+                              loading='lazy'
+                              decoding='async'
+                              sizes='48px'
+                            />
+                          )}
+                        </div>
 
-                          {/* 信息区域 */}
-                          <div className='flex-1 min-w-0 flex flex-col justify-between h-20'>
-                            {/* 标题和分辨率 - 顶部 */}
-                            <div className='flex items-start justify-between gap-3 h-6'>
-                              <div className='flex-1 min-w-0 relative group/title'>
+                        {/* 信息区域 */}
+                        <div className='flex-1 min-w-0 flex flex-col justify-between h-20'>
+                          {/* 标题和分辨率 - 顶部 */}
+                          <div className='flex items-start justify-between gap-3 h-6'>
+                            <div className='flex min-w-0 flex-1 items-center gap-1.5'>
+                              {sourceSortMode === 'latency' && latencyRank && (
+                                <span className='inline-flex h-4 min-w-5 shrink-0 items-center justify-center rounded bg-emerald-500/10 px-1 text-[10px] font-semibold text-emerald-700 dark:text-emerald-200'>
+                                  #{latencyRank}
+                                </span>
+                              )}
+                              <div className='min-w-0 flex-1 relative group/title'>
                                 <h3 className='font-medium text-base truncate text-gray-900 dark:text-gray-100 leading-none'>
                                   {source.title}
                                 </h3>
@@ -742,87 +994,99 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                                   </div>
                                 )}
                               </div>
-                              {(() => {
-                                if (statusBadge) {
-                                  return (
-                                    <div
-                                      className={`bg-gray-500/10 dark:bg-gray-400/20 ${statusBadge.className} px-1.5 py-0 rounded text-xs shrink-0 min-w-12.5 text-center`}
-                                    >
-                                      {statusBadge.label}
-                                    </div>
-                                  );
-                                }
-
-                                return null;
-                              })()}
                             </div>
+                            {(() => {
+                              if (statusBadge) {
+                                return (
+                                  <div
+                                    className={`bg-gray-500/10 dark:bg-gray-400/20 ${statusBadge.className} px-1.5 py-0 rounded text-xs shrink-0 min-w-12.5 text-center`}
+                                  >
+                                    {statusBadge.label}
+                                  </div>
+                                );
+                              }
 
-                            {/* 源名称和集数信息 - 垂直居中 */}
-                            <div className='flex items-center justify-between'>
-                              <span className='text-xs px-2 py-1 border border-gray-500/60 rounded text-gray-700 dark:text-gray-300'>
+                              return null;
+                            })()}
+                          </div>
+
+                          {/* 源名称和集数信息 - 垂直居中 */}
+                          <div className='flex items-center justify-between'>
+                            <div className='flex min-w-0 items-center gap-1.5'>
+                              <span className='max-w-[8.5rem] truncate text-xs px-2 py-1 border border-gray-500/60 rounded text-gray-700 dark:text-gray-300'>
                                 {source.source_name}
                               </span>
-                              {source.episodes.length > 1 && (
-                                <span className='text-xs text-gray-500 dark:text-gray-400 font-medium'>
-                                  {source.episodes.length} 集
+                              {isCurrentSource && (
+                                <span className='shrink-0 rounded bg-green-500/12 px-1.5 py-0.5 text-[10px] font-medium text-green-700 dark:text-green-300'>
+                                  当前
                                 </span>
                               )}
                             </div>
+                            {source.episodes.length > 1 && (
+                              <span className='text-xs text-gray-500 dark:text-gray-400 font-medium'>
+                                {source.episodes.length} 集
+                              </span>
+                            )}
+                          </div>
 
-                            {/* 网络信息 - 底部 */}
-                            <div className='flex items-end h-6'>
-                              {(() => {
-                                if (isTesting) {
+                          {/* 网络信息 - 底部 */}
+                          <div className='flex items-end h-6'>
+                            {(() => {
+                              if (isTesting) {
+                                return (
+                                  <div className='flex items-center gap-1.5 text-xs font-medium text-cyan-600 dark:text-cyan-300'>
+                                    <Wifi className='h-3 w-3' />
+                                    正在测速...
+                                  </div>
+                                );
+                              }
+
+                              if (videoInfo) {
+                                if (!videoInfo.hasError) {
                                   return (
-                                    <div className='flex items-center gap-1.5 text-xs font-medium text-cyan-600 dark:text-cyan-300'>
-                                      <Wifi className='h-3 w-3' />
-                                      正在测速...
+                                    <div className='flex items-end gap-3 text-xs'>
+                                      {videoInfo.pingTime > 0 && (
+                                        <div
+                                          className={`${getLatencyTextClassName(
+                                            videoInfo.pingTime,
+                                          )} font-medium text-xs`}
+                                        >
+                                          {videoInfo.pingTime}ms
+                                        </div>
+                                      )}
+                                      {videoInfo.loadSpeed !== '未知' ? (
+                                        <div className='text-green-600 dark:text-green-400 font-medium text-xs'>
+                                          {videoInfo.loadSpeed}
+                                        </div>
+                                      ) : (
+                                        <div className='text-sky-600 dark:text-sky-300 font-medium text-xs'>
+                                          已连通
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                } else {
+                                  return (
+                                    <div
+                                      className='text-red-500/90 dark:text-red-400 font-medium text-xs truncate'
+                                      title={videoInfo.message || '检测失败'}
+                                    >
+                                      {videoInfo.message || '检测失败'}
                                     </div>
                                   );
                                 }
-
-                                if (videoInfo) {
-                                  if (!videoInfo.hasError) {
-                                    return (
-                                      <div className='flex items-end gap-3 text-xs'>
-                                        {videoInfo.loadSpeed !== '未知' ? (
-                                          <div className='text-green-600 dark:text-green-400 font-medium text-xs'>
-                                            {videoInfo.loadSpeed}
-                                          </div>
-                                        ) : (
-                                          <div className='text-sky-600 dark:text-sky-300 font-medium text-xs'>
-                                            已连通
-                                          </div>
-                                        )}
-                                        {videoInfo.pingTime > 0 && (
-                                          <div className='text-orange-600 dark:text-orange-400 font-medium text-xs'>
-                                            {videoInfo.pingTime}ms
-                                          </div>
-                                        )}
-                                      </div>
-                                    );
-                                  } else {
-                                    return (
-                                      <div
-                                        className='text-red-500/90 dark:text-red-400 font-medium text-xs truncate'
-                                        title={videoInfo.message || '检测失败'}
-                                      >
-                                        {videoInfo.message || '检测失败'}
-                                      </div>
-                                    );
-                                  }
-                                }
-                                return (
-                                  <div className='text-gray-400 dark:text-gray-500 font-medium text-xs'>
-                                    待测速
-                                  </div>
-                                );
-                              })()}
-                            </div>
+                              }
+                              return (
+                                <div className='text-gray-400 dark:text-gray-500 font-medium text-xs'>
+                                  待测速
+                                </div>
+                              );
+                            })()}
                           </div>
                         </div>
-                      );
-                    })}
+                      </div>
+                    );
+                  })}
                   <div className='shrink-0 mt-auto pt-2 border-t border-gray-400 dark:border-gray-700'>
                     <button
                       onClick={() => {
