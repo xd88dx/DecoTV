@@ -23,6 +23,7 @@ export interface VideoSourceTestResult {
 }
 
 const DEFAULT_SOURCE_TEST_TIMEOUT_MS = 10000;
+const NATIVE_REACHABILITY_TIMEOUT_MS = 3000;
 
 function isLikelyHlsUrl(url: string): boolean {
   return /\.m3u8(?:$|[?#])/i.test(url) || /\/m3u8(?:$|[/?#])/i.test(url);
@@ -78,14 +79,18 @@ function getStatsLoadedBytes(stats: any, payload: any): number {
     : 0;
 }
 
-async function measureFetchLatency(url: string): Promise<number> {
+async function probeUrlReachability(
+  url: string,
+  timeoutMs = NATIVE_REACHABILITY_TIMEOUT_MS,
+): Promise<{ reachable: boolean; responseMs: number; message?: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const startedAt = performance.now();
 
   try {
     const response = await fetch(url, {
       cache: 'no-store',
+      mode: 'no-cors',
       signal: controller.signal,
     });
     const reader = response.body?.getReader();
@@ -93,9 +98,19 @@ async function measureFetchLatency(url: string): Promise<number> {
       await reader.read().catch(() => undefined);
       await reader.cancel().catch(() => undefined);
     }
-    return performance.now() - startedAt;
-  } catch {
-    return 0;
+    controller.abort();
+    return {
+      reachable: true,
+      responseMs: performance.now() - startedAt,
+    };
+  } catch (error) {
+    const aborted =
+      error instanceof DOMException && error.name === 'AbortError';
+    return {
+      reachable: false,
+      responseMs: 0,
+      message: aborted ? '连接超时' : '地址不可访问',
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -136,6 +151,7 @@ async function measureNativeVideoSource(
     let pingTime = 0;
     const startedAt = performance.now();
     let timeout: ReturnType<typeof setTimeout> | null = null;
+    let failureCheckStarted = false;
 
     const finish = (status: VideoSourceTestStatus, message?: string) => {
       if (finished) return;
@@ -156,17 +172,32 @@ async function measureNativeVideoSource(
       );
     };
 
-    timeout = setTimeout(() => {
-      finish('failed', '连接超时');
-    }, timeoutMs);
+    const finishAfterReachabilityCheck = async (fallbackMessage: string) => {
+      if (failureCheckStarted || finished) return;
+      failureCheckStarted = true;
+      const probe = await probeUrlReachability(
+        url,
+        Math.min(NATIVE_REACHABILITY_TIMEOUT_MS, timeoutMs),
+      );
+      if (finished) return;
 
-    void measureFetchLatency(url).then((latency) => {
-      if (latency > 0) pingTime = latency;
-    });
+      if (probe.reachable) {
+        pingTime = probe.responseMs;
+        finish('partial', `${fallbackMessage}，但地址可访问`);
+      } else {
+        finish('failed', probe.message || fallbackMessage);
+      }
+    };
+
+    timeout = setTimeout(() => {
+      void finishAfterReachabilityCheck('未在限定时间内返回媒体信息');
+    }, timeoutMs);
 
     video.onloadedmetadata = () => finish('ok', '媒体元数据可用');
     video.oncanplay = () => finish('ok', '可播放');
-    video.onerror = () => finish('failed', '媒体加载失败');
+    video.onerror = () => {
+      void finishAfterReachabilityCheck('浏览器无法解析该媒体');
+    };
     video.src = url;
   });
 }
@@ -209,9 +240,9 @@ export async function getVideoResolutionFromM3u8(
       autoStartLoad: true,
       enableWorker: true,
       lowLatencyMode: false,
-      maxBufferLength: 8,
+      maxBufferLength: 4,
       backBufferLength: 0,
-      maxBufferSize: 24 * 1000 * 1000,
+      maxBufferSize: 8 * 1000 * 1000,
     });
 
     let finished = false;
@@ -279,12 +310,6 @@ export async function getVideoResolutionFromM3u8(
       }
     };
 
-    void measureFetchLatency(m3u8Url).then((latency) => {
-      if (latency > 0 && (!pingTime || latency < pingTime)) {
-        pingTime = latency;
-      }
-    });
-
     video.onloadedmetadata = () => {
       playable = true;
       const nativeQuality = qualityFromWidth(video.videoWidth);
@@ -299,7 +324,7 @@ export async function getVideoResolutionFromM3u8(
       if (manifestLoaded || speedKBps > 0) {
         finish('partial', '媒体元素未返回元数据，但源已连通');
       } else {
-        finish('failed', '媒体加载失败');
+        finish('failed', '浏览器未能加载媒体，未确认源可用');
       }
     };
 
@@ -350,7 +375,19 @@ export async function getVideoResolutionFromM3u8(
 
     hls.on(Hls.Events.ERROR, (_event: any, data: any) => {
       if (!data?.fatal) return;
-      const message = data?.details || data?.type || 'HLS 加载失败';
+      const details = String(data?.details || '');
+      const message = (() => {
+        if (/manifest/i.test(details)) {
+          return '播放清单不可访问或格式异常';
+        }
+        if (/frag/i.test(details)) {
+          return '媒体分片加载失败，源不稳定';
+        }
+        if (/buffer|media/i.test(details)) {
+          return '浏览器解码失败，源可能不兼容';
+        }
+        return data?.details || data?.type || 'HLS 加载失败';
+      })();
       if (manifestLoaded || speedKBps > 0) {
         finish('partial', message);
       } else {

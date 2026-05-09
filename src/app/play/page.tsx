@@ -1390,7 +1390,7 @@ function PlayPageClient() {
     };
 
     // 分批并发测速，避免一次性过多请求拖垮浏览器和上游源站。
-    const batchSize = Math.min(4, Math.max(1, Math.ceil(sources.length / 2)));
+    const batchSize = Math.min(2, Math.max(1, Math.ceil(sources.length / 2)));
     const allResults: Array<{
       source: SearchResult;
       testResult: VideoSourceTestResult;
@@ -1415,7 +1415,9 @@ function PlayPageClient() {
             };
           }
 
-          const testResult = await getVideoResolutionFromM3u8(episodeUrl);
+          const testResult = await getVideoResolutionFromM3u8(episodeUrl, {
+            timeoutMs: 9000,
+          });
           return { source, testResult };
         }),
       );
@@ -1515,7 +1517,7 @@ function PlayPageClient() {
     })();
     score += qualityScore * 0.4;
 
-    // 下载速度评分 (40% 权重) - 基于最大速度线性映射
+    // 下载速度评分 (45% 权重) - 基于最大速度线性映射
     const speedScore = (() => {
       const speedKBps = testResult.speedKBps || 0;
       if (speedKBps <= 0) return testResult.status === 'partial' ? 45 : 25;
@@ -1524,9 +1526,9 @@ function PlayPageClient() {
       const speedRatio = speedKBps / maxSpeed;
       return Math.min(100, Math.max(0, speedRatio * 100));
     })();
-    score += speedScore * 0.4;
+    score += speedScore * 0.45;
 
-    // 网络延迟评分 (20% 权重) - 基于延迟范围线性映射
+    // 网络响应评分 (15% 权重) - 响应容易受瞬时抖动影响，权重低于实际分片速度
     const pingScore = (() => {
       const ping = testResult.pingTime;
       if (ping <= 0) return 0; // 无效延迟给默认分
@@ -1538,7 +1540,7 @@ function PlayPageClient() {
       const pingRatio = (maxPing - ping) / (maxPing - minPing);
       return Math.min(100, Math.max(0, pingRatio * 100));
     })();
-    score += pingScore * 0.2;
+    score += pingScore * 0.15;
 
     if (testResult.status === 'partial') {
       score -= 8;

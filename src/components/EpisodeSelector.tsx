@@ -19,6 +19,7 @@ import ExternalImage from '@/components/ExternalImage';
 // 定义视频信息类型
 type VideoInfo = VideoSourceTestResult;
 type SourceSortMode = 'default' | 'latency';
+const RESPONSE_TIE_BREAKER_MS = 300;
 
 interface SourceSortItem {
   source: SearchResult;
@@ -57,11 +58,13 @@ function compareDefaultSourceOrder(a: SourceSortItem, b: SourceSortItem) {
 
 function compareLatencyMetrics(a: SourceSortItem, b: SourceSortItem) {
   const pingDiff = (a.videoInfo?.pingTime || 0) - (b.videoInfo?.pingTime || 0);
-  if (pingDiff !== 0) return pingDiff;
+  if (Math.abs(pingDiff) > RESPONSE_TIE_BREAKER_MS) return pingDiff;
 
   const speedDiff =
     (b.videoInfo?.speedKBps || 0) - (a.videoInfo?.speedKBps || 0);
   if (speedDiff !== 0) return speedDiff;
+
+  if (pingDiff !== 0) return pingDiff;
 
   if (a.isCurrentSource && !b.isCurrentSource) return -1;
   if (!a.isCurrentSource && b.isCurrentSource) return 1;
@@ -96,10 +99,26 @@ function compareLatencySourceOrder(a: SourceSortItem, b: SourceSortItem) {
   return a.originalIndex - b.originalIndex;
 }
 
+function formatResponseTime(ms: number) {
+  if (!Number.isFinite(ms) || ms <= 0) return '未测得';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 10000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms / 1000)}s`;
+}
+
 function getLatencyTextClassName(pingTime: number) {
-  if (pingTime <= 600) return 'text-green-600 dark:text-green-400';
-  if (pingTime <= 1800) return 'text-orange-600 dark:text-orange-400';
+  if (pingTime <= 800) return 'text-green-600 dark:text-green-400';
+  if (pingTime <= 2500) return 'text-orange-600 dark:text-orange-400';
   return 'text-red-600 dark:text-red-400';
+}
+
+function getSpeedTextClassName(speedKBps?: number) {
+  if (!speedKBps || !Number.isFinite(speedKBps) || speedKBps <= 0) {
+    return 'text-gray-500 dark:text-gray-400';
+  }
+  if (speedKBps >= 2048) return 'text-green-600 dark:text-green-400';
+  if (speedKBps >= 512) return 'text-sky-600 dark:text-sky-300';
+  return 'text-orange-600 dark:text-orange-400';
 }
 
 interface EpisodeSelectorProps {
@@ -288,7 +307,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
 
       try {
         const info = await getVideoResolutionFromM3u8(episodeUrl, {
-          timeoutMs: force ? 12000 : 10000,
+          timeoutMs: force ? 10000 : 8000,
         });
         if (isCurrentTestScope()) {
           setVideoInfoMap((prev) => new Map(prev).set(sourceKey, info));
@@ -327,7 +346,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
     setManualTesting(true);
     setManualProgress({ done: 0, total: availableSources.length });
 
-    const batchSize = 3;
+    const batchSize = 2;
     try {
       for (let start = 0; start < availableSources.length; start += batchSize) {
         const batch = availableSources.slice(start, start + batchSize);
@@ -413,7 +432,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
       if (pendingSources.length === 0) return;
 
       const batchSize = Math.min(
-        3,
+        2,
         Math.max(1, Math.ceil(pendingSources.length / 2)),
       );
 
@@ -633,16 +652,22 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
 
     if (sourceSortMode === 'latency') {
       if (fastestLatencyItem?.videoInfo) {
-        return `最快 ${fastestLatencyItem.videoInfo.pingTime}ms · ${fastestLatencyItem.source.source_name}`;
+        const speedText =
+          fastestLatencyItem.videoInfo.loadSpeed !== '未知'
+            ? ` · 速度 ${fastestLatencyItem.videoInfo.loadSpeed}`
+            : '';
+        return `最快响应 ${formatResponseTime(
+          fastestLatencyItem.videoInfo.pingTime,
+        )}${speedText} · ${fastestLatencyItem.source.source_name}`;
       }
-      return failedSourceCount > 0 ? '测速完成，暂无可用延迟' : '等待延迟数据';
+      return failedSourceCount > 0 ? '测速完成，暂无可用响应' : '等待响应数据';
     }
 
     if (hasManualTested) {
       return `已测速 ${testedSourceCount}/${availableSources.length}`;
     }
 
-    return '手动测速后自动排序';
+    return '手动测速后按响应排序';
   })();
 
   const getSourceStatusBadge = (
@@ -919,7 +944,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                         }`}
                       >
                         <ArrowDownNarrowWide className='h-3 w-3' />
-                        延迟
+                        响应
                       </button>
                     </div>
                     <div
@@ -1044,23 +1069,30 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                               if (videoInfo) {
                                 if (!videoInfo.hasError) {
                                   return (
-                                    <div className='flex items-end gap-3 text-xs'>
+                                    <div className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs'>
                                       {videoInfo.pingTime > 0 && (
                                         <div
                                           className={`${getLatencyTextClassName(
                                             videoInfo.pingTime,
                                           )} font-medium text-xs`}
                                         >
-                                          {videoInfo.pingTime}ms
+                                          响应{' '}
+                                          {formatResponseTime(
+                                            videoInfo.pingTime,
+                                          )}
                                         </div>
                                       )}
                                       {videoInfo.loadSpeed !== '未知' ? (
-                                        <div className='text-green-600 dark:text-green-400 font-medium text-xs'>
-                                          {videoInfo.loadSpeed}
+                                        <div
+                                          className={`${getSpeedTextClassName(
+                                            videoInfo.speedKBps,
+                                          )} font-medium text-xs`}
+                                        >
+                                          速度 {videoInfo.loadSpeed}
                                         </div>
                                       ) : (
-                                        <div className='text-sky-600 dark:text-sky-300 font-medium text-xs'>
-                                          已连通
+                                        <div className='text-gray-500 dark:text-gray-400 font-medium text-xs'>
+                                          速度未测得
                                         </div>
                                       )}
                                     </div>
